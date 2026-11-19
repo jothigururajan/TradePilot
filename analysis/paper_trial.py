@@ -1,10 +1,11 @@
 """
 1-Month Automated Paper Trading & Forward-Test Journal Engine for TradePilot NSE.
-Manages a dedicated ₹50,000 (configurable + top-up) forward-testing trial:
+Manages a dedicated ₹50,000 (configurable + auto-top-up) forward-testing trial:
 1. Checks all OPEN paper trial positions against the latest EOD bar for Stop-Loss, Target, or Time Exits.
 2. Scans today's BUY WATCH signals sorted by Overall Score (highest first) and enters up to 1-3 top stocks.
-3. If zero stocks have a BUY WATCH signal, records 0 entries for the day.
-4. Logs every daily run, entry, exit, charges (0.18% round-trip), net P&L, and realized R-multiple in SQLite.
+3. Uses a 12% per-trade allocation cap and up to 25 open positions so the trial runs smoothly all month.
+4. Optionally auto-adds ₹25,000 capital when cash is low so valid daily BUY WATCH signals are never skipped.
+5. If zero stocks have a BUY WATCH signal, records 0 entries for the day.
 """
 from datetime import timedelta
 from typing import Any, Dict, List, Optional
@@ -28,12 +29,21 @@ def init_paper_trial_tables(db: DatabaseManager) -> None:
                 initial_capital REAL NOT NULL DEFAULT 50000.0,
                 added_capital REAL NOT NULL DEFAULT 0.0,
                 max_daily_entries INTEGER NOT NULL DEFAULT 3,
-                max_open_positions INTEGER NOT NULL DEFAULT 6,
+                max_open_positions INTEGER NOT NULL DEFAULT 25,
                 risk_per_trade_pct REAL NOT NULL DEFAULT 1.5,
                 max_holding_days INTEGER NOT NULL DEFAULT 15,
-                is_active INTEGER NOT NULL DEFAULT 1
+                is_active INTEGER NOT NULL DEFAULT 1,
+                auto_topup_enabled INTEGER NOT NULL DEFAULT 1,
+                per_trade_alloc_pct REAL NOT NULL DEFAULT 12.0
             )
         """)
+        # Safe schema migration for existing DBs
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(paper_trial_config)").fetchall()]
+        if "auto_topup_enabled" not in cols:
+            conn.execute("ALTER TABLE paper_trial_config ADD COLUMN auto_topup_enabled INTEGER NOT NULL DEFAULT 1")
+        if "per_trade_alloc_pct" not in cols:
+            conn.execute("ALTER TABLE paper_trial_config ADD COLUMN per_trade_alloc_pct REAL NOT NULL DEFAULT 12.0")
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS paper_trial_trades (
                 trade_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -73,12 +83,11 @@ def init_paper_trial_tables(db: DatabaseManager) -> None:
         """)
         conn.commit()
 
-    # Seed default 1-month trial config if empty (starting next Monday or today)
+    # Seed default 1-month trial config if empty
     with db.get_connection() as conn:
-        row = conn.execute("SELECT id FROM paper_trial_config WHERE id = 1").fetchone()
+        row = conn.execute("SELECT id, max_open_positions FROM paper_trial_config WHERE id = 1").fetchone()
         if not row:
             today = now_ist().date()
-            # Default start date: upcoming Monday if weekend, else today
             days_until_mon = (7 - today.weekday()) % 7
             start_dt = today + timedelta(days=days_until_mon) if today.weekday() >= 5 else today
             end_dt = start_dt + timedelta(days=30)
@@ -86,11 +95,16 @@ def init_paper_trial_tables(db: DatabaseManager) -> None:
                 """
                 INSERT INTO paper_trial_config
                 (id, start_date, end_date, initial_capital, added_capital, max_daily_entries,
-                 max_open_positions, risk_per_trade_pct, max_holding_days, is_active)
-                VALUES (1, ?, ?, 50000.0, 0.0, 3, 6, 1.5, 15, 1)
+                 max_open_positions, risk_per_trade_pct, max_holding_days, is_active,
+                 auto_topup_enabled, per_trade_alloc_pct)
+                VALUES (1, ?, ?, 50000.0, 0.0, 3, 25, 1.5, 15, 1, 1, 12.0)
                 """,
                 (start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d")),
             )
+            conn.commit()
+        elif row["max_open_positions"] == 6:
+            # Upgrade legacy default 6 -> 25 so 1-month trial doesn't stall mid-week
+            conn.execute("UPDATE paper_trial_config SET max_open_positions = 25, per_trade_alloc_pct = 12.0, auto_topup_enabled = 1 WHERE id = 1")
             conn.commit()
 
 
@@ -111,6 +125,8 @@ def update_paper_trial_config(
     risk_per_trade_pct: float,
     max_holding_days: int,
     is_active: bool = True,
+    auto_topup_enabled: bool = True,
+    per_trade_alloc_pct: float = 12.0,
 ) -> None:
     init_paper_trial_tables(db)
     with db.get_connection() as conn:
@@ -118,7 +134,8 @@ def update_paper_trial_config(
             """
             UPDATE paper_trial_config
             SET start_date = ?, end_date = ?, initial_capital = ?, max_daily_entries = ?,
-                max_open_positions = ?, risk_per_trade_pct = ?, max_holding_days = ?, is_active = ?
+                max_open_positions = ?, risk_per_trade_pct = ?, max_holding_days = ?, is_active = ?,
+                auto_topup_enabled = ?, per_trade_alloc_pct = ?
             WHERE id = 1
             """,
             (
@@ -130,6 +147,8 @@ def update_paper_trial_config(
                 float(risk_per_trade_pct),
                 int(max_holding_days),
                 1 if is_active else 0,
+                1 if auto_topup_enabled else 0,
+                float(per_trade_alloc_pct),
             ),
         )
         conn.commit()
@@ -155,7 +174,8 @@ def reset_paper_trial(db: DatabaseManager, initial_capital: float = 50000.0, sta
         conn.execute(
             """
             UPDATE paper_trial_config
-            SET start_date = ?, end_date = ?, initial_capital = ?, added_capital = 0.0, is_active = 1
+            SET start_date = ?, end_date = ?, initial_capital = ?, added_capital = 0.0,
+                max_open_positions = 25, per_trade_alloc_pct = 12.0, auto_topup_enabled = 1, is_active = 1
             WHERE id = 1
             """,
             (s_dt.strftime("%Y-%m-%d"), e_dt.strftime("%Y-%m-%d"), float(initial_capital)),
@@ -168,7 +188,8 @@ def run_daily_paper_trial_step(db: DatabaseManager, run_date_str: Optional[str] 
     Executes one daily paper-trading cycle:
     1. Checks OPEN positions against latest market bar for exits (Stop-Loss, Target, or Time Exit).
     2. Checks today's BUY WATCH signals sorted by Overall Score descending and enters top 1-3 stocks.
-    3. If 0 BUY WATCH signals exist, takes 0 entries.
+    3. Auto-adds ₹25,000 capital if auto_topup_enabled=1 and cash is insufficient for a valid BUY WATCH entry.
+    4. If 0 BUY WATCH signals exist, takes 0 entries.
     """
     init_paper_trial_tables(db)
     cfg = get_paper_trial_config(db)
@@ -192,7 +213,6 @@ def run_daily_paper_trial_step(db: DatabaseManager, run_date_str: Optional[str] 
     for row in open_rows:
         pos = dict(row)
         sym = pos["symbol"]
-        # Do not exit on the exact same bar it was entered
         if pos["entry_date"] >= eff_date:
             continue
 
@@ -200,7 +220,6 @@ def run_daily_paper_trial_step(db: DatabaseManager, run_date_str: Optional[str] 
         if hist.empty:
             continue
 
-        # Check latest bar (or bars since entry)
         recent_bars = hist[hist["trade_date"] > pos["entry_date"]]
         if recent_bars.empty:
             continue
@@ -235,7 +254,7 @@ def run_daily_paper_trial_step(db: DatabaseManager, run_date_str: Optional[str] 
         if exit_px is not None:
             qty = int(pos["quantity"])
             gross_pnl = (exit_px - pos["entry_price"]) * qty
-            charges = (pos["entry_price"] + exit_px) * qty * 0.0018  # 0.18% realistic delivery STT/brokerage
+            charges = (pos["entry_price"] + exit_px) * qty * 0.0018
             net_pnl = gross_pnl - charges
             invested = pos["entry_price"] * qty
             ret_pct = (net_pnl / invested) * 100.0 if invested > 0 else 0.0
@@ -281,6 +300,8 @@ def run_daily_paper_trial_step(db: DatabaseManager, run_date_str: Optional[str] 
     max_new = int(cfg["max_daily_entries"])
     max_open = int(cfg["max_open_positions"])
     risk_pct = float(cfg["risk_per_trade_pct"])
+    alloc_pct = float(cfg.get("per_trade_alloc_pct", 12.0)) / 100.0
+    auto_topup = bool(cfg.get("auto_topup_enabled", 1))
 
     if buy_signals_count == 0:
         entry_notes.append("No BUY WATCH signals today — 0 entries taken.")
@@ -297,12 +318,22 @@ def run_daily_paper_trial_step(db: DatabaseManager, run_date_str: Optional[str] 
             tgt_px = float(cand["target_2"])
             risk_per_sh = max(entry_px - sl_px, entry_px * 0.01)
 
-            # Position sizing: risk_pct of equity, capped at 35% of total equity and available cash
+            # Target sizing based on risk_pct and per-trade allocation cap (e.g. 12% of equity, minimum 1 share)
             max_risk_inr = current_equity * (risk_pct / 100.0)
             qty_by_risk = math.floor(max_risk_inr / risk_per_sh)
-            qty_by_alloc = math.floor((current_equity * 0.35) / entry_px)
+            qty_by_alloc = max(1, math.floor((current_equity * alloc_pct) / entry_px))
+            desired_qty = max(1, min(qty_by_risk if qty_by_risk > 0 else qty_by_alloc, qty_by_alloc))
+
+            needed_cash = desired_qty * entry_px
+            if cash_available < entry_px and auto_topup:
+                topup_amt = max(25000.0, math.ceil((needed_cash - cash_available) / 5000.0) * 5000.0)
+                add_trial_capital(db, topup_amt)
+                cash_available += topup_amt
+                current_equity += topup_amt
+                entry_notes.append(f"AUTO-TOPUP +₹{topup_amt:,.0f}")
+
             qty_by_cash = math.floor(cash_available / entry_px)
-            qty = min(qty_by_risk if qty_by_risk > 0 else qty_by_alloc, qty_by_alloc, qty_by_cash)
+            qty = min(desired_qty, qty_by_cash)
 
             if qty <= 0:
                 continue
